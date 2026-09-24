@@ -1,4 +1,3 @@
-from bisect import bisect_right
 from .superposition_calculation import *
 
 
@@ -10,7 +9,8 @@ def der(df_super, L):
 
     This function calculates the derivative of pressure changes (`Delta_Pressure`) with respect to time (`Delta_Time`) 
     using Bourdet method. The derivative is computed for each point in the input DataFrame 
-    based on neighboring points, using binary search for efficient indexing.
+    based on neighboring points. Neighbor indices for all points are found at once with a vectorized
+    binary search (`np.searchsorted`), so no Python-level loop over the data is needed.
 
     Parameters:
     - df_super (pd.DataFrame): Input DataFrame containing the following columns:
@@ -39,45 +39,45 @@ def der(df_super, L):
     # set the smoothing factor, this is important when the data goes to the end, to ensure the real response, the L should be smaller.
     exp_L = np.exp(L)
     exp_L_half = np.exp(L / 2)
-    derivatives = []
-    
-    # Create sorted lists for binary search
-    delta_times = df_super['Delta_Time'].tolist()
-    superposition = df_super['Superposition'].tolist()
-    delta_pressure = df_super['Delta_Pressure'].tolist()
-    
-    for i in range(len(delta_times) - 2):
-        t0, p0, dt0 = superposition[i], delta_pressure[i], delta_times[i]
-        dt_exp_L = dt0 * exp_L
-        
-        # Binary search for the next index
-        idx1 = bisect_right(delta_times, dt_exp_L, i + 1)
-        if idx1 < len(delta_times):
-            t1, p1, dt1 = superposition[idx1], delta_pressure[idx1], delta_times[idx1]
-            dt_exp_L_next = dt1 * exp_L
-            
-            # Binary search for the subsequent index
-            idx2 = bisect_right(delta_times, dt_exp_L_next, idx1 + 1)
-            if idx2 < len(delta_times):
-                t2, p2 = superposition[idx2], delta_pressure[idx2]
-                # Calculate derivatives
-                x1, x2 = t1 - t0, t2 - t1
-                pp1, pp2 = abs(p1 - p0), abs(p2 - p1)
-                der = (pp1 / x1 * x2 + pp2 / x2 * x1) / (x1 + x2)
-                derivatives.append([t1, p1, dt1, der / np.log(10)])
-            else:
-                dt_exp_L_half_next = dt1 * exp_L_half
-                idx2 = bisect_right(delta_times, dt_exp_L_half_next, idx1 + 1)
-                if idx2 < len(delta_times):
-                    t2, p2 = superposition[idx2], delta_pressure[idx2]
-                    # Calculate derivatives
-                    x1, x2 = t1 - t0, t2 - t1
-                    pp1, pp2 = abs(p1 - p0), abs(p2 - p1)
-                    der = (pp1 / x1 * x2 + pp2 / x2 * x1) / (x1 + x2)
-                    derivatives.append([t1, p1, dt1, der / np.log(10)])
 
-    df_derivative = pd.DataFrame(derivatives, columns=['Superposition', 'Delta_Pressure', 'Delta_Time', 'Derivative'])
-    
+    # Delta_Time is sorted ascending, so neighbor lookups can use a vectorized binary search
+    delta_times = df_super['Delta_Time'].to_numpy(dtype=float)
+    superposition = df_super['Superposition'].to_numpy(dtype=float)
+    delta_pressure = df_super['Delta_Pressure'].to_numpy(dtype=float)
+    n = len(delta_times)
+
+    # current point index (t0, p0) for every candidate point
+    idx0 = np.arange(max(n - 2, 0))
+
+    # next index: first point after idx0 with Delta_Time > dt0 * exp(L)
+    idx1 = np.maximum(idx0 + 1, np.searchsorted(delta_times, delta_times[idx0] * exp_L, side='right'))
+    valid = idx1 < n
+    idx0, idx1 = idx0[valid], idx1[valid]
+
+    # subsequent index: first point after idx1 with Delta_Time > dt1 * exp(L)
+    idx2 = np.maximum(idx1 + 1, np.searchsorted(delta_times, delta_times[idx1] * exp_L, side='right'))
+
+    # near the end of the data, fall back to the half smoothing window exp(L / 2)
+    fallback = idx2 >= n
+    idx2[fallback] = np.maximum(idx1[fallback] + 1,
+                                np.searchsorted(delta_times, delta_times[idx1[fallback]] * exp_L_half, side='right'))
+    valid = idx2 < n
+    idx0, idx1, idx2 = idx0[valid], idx1[valid], idx2[valid]
+
+    # Calculate derivatives
+    x1 = superposition[idx1] - superposition[idx0]
+    x2 = superposition[idx2] - superposition[idx1]
+    if np.any(x1 == 0) or np.any(x2 == 0) or np.any(x1 + x2 == 0):
+        raise ZeroDivisionError("float division by zero: repeated superposition time values")
+    pp1 = np.abs(delta_pressure[idx1] - delta_pressure[idx0])
+    pp2 = np.abs(delta_pressure[idx2] - delta_pressure[idx1])
+    derivative = (pp1 / x1 * x2 + pp2 / x2 * x1) / (x1 + x2) / np.log(10)
+
+    df_derivative = pd.DataFrame({'Superposition': superposition[idx1],
+                                  'Delta_Pressure': delta_pressure[idx1],
+                                  'Delta_Time': delta_times[idx1],
+                                  'Derivative': derivative})
+
     return df_derivative
 
 
